@@ -18,7 +18,7 @@ let youtubeClientPromise;
 function getYoutubeClient() {
   if (!youtubeClientPromise) {
     youtubeClientPromise = import('@distube/ytdl-core').then(module => ({
-      client: new module.Ytdl({ lang: 'ru', country: 'RU' }),
+      client: new module.Ytdl({ lang: 'ru', country: 'RU', cookie: process.env.YOUTUBE_COOKIE || undefined }),
       Quality: module.Quality,
       SearchType: module.SearchType,
     }));
