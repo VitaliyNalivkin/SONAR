@@ -1,8 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Events, MessageFlags, PermissionFlagsBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, StreamType } = require('@discordjs/voice');
-const { spawn } = require('node:child_process');
-const ffmpegPath = require('ffmpeg-static');
 const play = require('play-dl');
 
 if (!process.env.DISCORD_TOKEN) {
@@ -38,10 +36,9 @@ function getQueue(guildId) {
   let queue = queues.get(guildId);
   if (!queue) {
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
-    queue = { player, connection: null, tracks: [], currentTrack: null, textChannel: null, starting: false, idleTimer: null, ffmpegProcess: null };
+    queue = { player, connection: null, tracks: [], currentTrack: null, textChannel: null, starting: false, idleTimer: null };
     player.on(AudioPlayerStatus.Idle, () => {
       queue.starting = false;
-      stopEncoder(queue);
       if (queue.currentTrack && queue.tracks[0] === queue.currentTrack) queue.tracks.shift();
       queue.currentTrack = null;
       void playNext(guildId);
@@ -49,7 +46,6 @@ function getQueue(guildId) {
     player.on('error', error => {
       console.error('Ошибка воспроизведения:', error.message);
       queue.starting = false;
-      stopEncoder(queue);
       const failedTrack = error.resource?.metadata || queue.currentTrack;
       queue.currentTrack = null;
       if (/cookie.*(signed out|expired|invalid)|treats the cookie as signed out/i.test(error.message)) {
@@ -72,12 +68,6 @@ function getQueue(guildId) {
     queues.set(guildId, queue);
   }
   return queue;
-}
-
-function stopEncoder(queue) {
-  const process = queue.ffmpegProcess;
-  queue.ffmpegProcess = null;
-  if (process && process.exitCode === null && !process.killed) process.kill();
 }
 
 function clearIdleTimer(queue) {
@@ -213,35 +203,13 @@ async function playNext(guildId) {
   try {
     const { client: youtube, Quality } = await getYoutubeClient();
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) return;
-    // Discord can forward Opus packets directly; selecting WebM/Opus avoids
-    // probing/transcoding the stream and does not require an FFmpeg install.
-    if (!ffmpegPath) throw new Error('Не найден FFmpeg. Повтори установку зависимостей через start.bat.');
+    // Pass YouTube's Opus stream straight to Discord to avoid FFmpeg startup and transcoding delay.
     const audioStream = youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
     // The queue may have been stopped while the stream URL was being resolved.
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) { audioStream.destroy(); return; }
-    const encoder = spawn(ffmpegPath, [
-      '-hide_banner', '-loglevel', 'error',
-      '-fflags', 'nobuffer', '-probesize', '32', '-analyzeduration', '0',
-      '-i', 'pipe:0', '-vn',
-      '-af', 'dynaudnorm=f=100:g=5:p=0.95:m=10',
-      '-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '2', '-application', 'audio',
-      '-flush_packets', '1', '-page_duration', '20000', '-f', 'ogg', 'pipe:1',
-    ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    queue.ffmpegProcess = encoder;
-    let encoderError = '';
-    encoder.stderr.setEncoding('utf8');
-    encoder.stderr.on('data', chunk => { encoderError = (encoderError + chunk).slice(-4000); });
-    encoder.stdin.on('error', error => { if (error.code !== 'EPIPE') console.error('Ошибка входного потока FFmpeg:', error.message); });
-    audioStream.on('error', error => encoder.stdin.destroy(error));
-    encoder.on('error', error => encoder.stdout.destroy(error));
-    encoder.on('close', code => {
-      if (code !== 0 && !encoder.stdout.destroyed) {
-        encoder.stdout.destroy(new Error(encoderError.trim() || `FFmpeg завершился с кодом ${code}`));
-      }
-    });
-    audioStream.pipe(encoder.stdin);
+    audioStream.on('error', error => console.error('Ошибка потока YouTube:', error.message));
     queue.currentTrack = track;
-    queue.player.play(createAudioResource(encoder.stdout, { inputType: StreamType.OggOpus, metadata: track }));
+    queue.player.play(createAudioResource(audioStream, { inputType: StreamType.WebmOpus, metadata: track }));
     queue.starting = false;
     await queue.textChannel?.send(`▶️ Сейчас играет: **${track.title}**${track.author ? ` — ${track.author}` : ''}${track.duration ? ` (${track.duration})` : ''}`);
   } catch (error) {
@@ -294,7 +262,6 @@ function gracefulShutdown(signal) {
       clearIdleTimer(queue);
       queue.tracks.length = 0;
       queue.player.stop(true);
-      stopEncoder(queue);
       try { queue.connection?.destroy(); } catch (error) { console.warn('Не удалось закрыть голосовое подключение:', error.message); }
     }
     queues.clear();
@@ -319,9 +286,8 @@ client.on(Events.InteractionCreate, async interaction => {
     const input = interaction.options.getString('запрос', true).trim();
     await interaction.deferReply();
     await interaction.editReply('🔎 Ищу трек…');
+    const queue = getQueue(interaction.guildId);
     try {
-      const tracks = await resolveTrack(input);
-      const queue = getQueue(interaction.guildId);
       if (!queue.connection || queue.connection.state.status === 'destroyed') {
         queue.connection = joinVoiceChannel({ channelId: voiceChannel.id, guildId: interaction.guildId, adapterCreator: interaction.guild.voiceAdapterCreator, selfDeaf: true });
         queue.connection.subscribe(queue.player);
@@ -330,6 +296,7 @@ client.on(Events.InteractionCreate, async interaction => {
       }
       queue.textChannel = interaction.channel;
       clearIdleTimer(queue);
+      const tracks = await resolveTrack(input);
       queue.tracks.push(...tracks);
       const first = tracks[0];
       const firstLabel = `**${first.title}**${first.author ? ` — ${first.author}` : ''}`;
@@ -343,6 +310,8 @@ client.on(Events.InteractionCreate, async interaction => {
         ? 'YouTube вернул некорректный ответ. Попробуй ещё раз позже или вставь прямую ссылку на видео.'
         : (error.message || 'Не удалось найти или открыть этот трек.');
       await interaction.editReply(message);
+      if (!queue.tracks.length) scheduleIdleDisconnect(interaction.guildId, queue);
+      if (!queue.connection && !queue.tracks.length) queues.delete(interaction.guildId);
     }
     return;
   }
