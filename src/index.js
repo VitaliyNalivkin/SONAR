@@ -30,12 +30,28 @@ function getQueue(guildId) {
   let queue = queues.get(guildId);
   if (!queue) {
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
-    queue = { player, connection: null, tracks: [], textChannel: null, starting: false, idleTimer: null, ffmpegProcess: null };
-    player.on(AudioPlayerStatus.Idle, () => { queue.starting = false; stopEncoder(queue); queue.tracks.shift(); void playNext(guildId); });
+    queue = { player, connection: null, tracks: [], currentTrack: null, textChannel: null, starting: false, idleTimer: null, ffmpegProcess: null };
+    player.on(AudioPlayerStatus.Idle, () => {
+      queue.starting = false;
+      stopEncoder(queue);
+      if (queue.currentTrack && queue.tracks[0] === queue.currentTrack) queue.tracks.shift();
+      queue.currentTrack = null;
+      void playNext(guildId);
+    });
     player.on('error', error => {
       console.error('Ошибка воспроизведения:', error.message);
       queue.starting = false;
       stopEncoder(queue);
+      const failedTrack = error.resource?.metadata || queue.currentTrack;
+      queue.currentTrack = null;
+      if (queue.tracks[0] === failedTrack && failedTrack?.alternatives?.length) {
+        const nextTrack = failedTrack.alternatives.shift();
+        nextTrack.alternatives = failedTrack.alternatives;
+        queue.tracks[0] = nextTrack;
+        console.warn(`Видео недоступно, пробую следующий результат: ${nextTrack.title}`);
+        void playNext(guildId);
+        return;
+      }
       queue.tracks.shift();
       void playNext(guildId);
     });
@@ -111,21 +127,38 @@ async function resolveTrack(input) {
   // Resolve their title to a playable YouTube result.
   const query = isUrl(input) ? await getSearchText(input) : input;
   const { client: youtube, SearchType } = await getYoutubeClient();
-  const options = { limit: 1, signal: AbortSignal.timeout(15_000) };
+  const options = { limit: 5, signal: AbortSignal.timeout(15_000) };
   let results;
+  let searchError;
   try {
     results = await youtube.search(query, { ...options, type: SearchType.Song });
-    if (!results.length) results = await youtube.search(query, options);
+    if (!results.length) results = await youtube.search(query, { ...options, type: SearchType.Video });
   } catch (error) {
-    console.error('Не удалось выполнить поиск на YouTube:', error.message);
-    throw new Error('Не удалось найти трек. Попробуй другое название или ссылку.');
+    searchError = error;
+    console.warn('Поиск через ytdl не сработал, пробую резервный поиск:', error.message);
+    try { results = await play.search(query, { limit: 5, source: { youtube: 'video' } }); }
+    catch (fallbackError) {
+      console.error('Не удалось выполнить поиск на YouTube:', fallbackError.message);
+      throw new Error(searchError.code === 'HPE_HEADER_OVERFLOW'
+        ? 'YouTube вернул некорректный ответ. Попробуй ещё раз через минуту или вставь прямую ссылку.'
+        : 'Не удалось найти трек. Попробуй другое название или ссылку.');
+    }
   }
-  const video = results.find(item => item.url);
+  const candidates = results.filter(item => item.url && !item.isLive && !item.isUpcoming).slice(0, 5);
+  const video = candidates[0];
   if (!video) throw new Error('Не удалось найти трек. Попробуй другое название или ссылку.');
-  const duration = Number.isFinite(video.lengthSeconds)
-    ? `${Math.floor(video.lengthSeconds / 60)}:${String(video.lengthSeconds % 60).padStart(2, '0')}`
-    : null;
-  return [{ title: video.title, author: video.author?.name, url: video.url, duration }];
+  const toTrack = item => {
+    const seconds = Number.isFinite(item.lengthSeconds) ? item.lengthSeconds : item.durationInSec;
+    return {
+      title: item.title,
+      author: item.author?.name || item.channel?.name || item.channel?.title,
+      url: item.url,
+      duration: Number.isFinite(seconds) ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : item.durationRaw || null,
+    };
+  };
+  const track = toTrack(video);
+  track.alternatives = candidates.slice(1).map(toTrack);
+  return [track];
 }
 
 async function playNext(guildId) {
@@ -164,13 +197,24 @@ async function playNext(guildId) {
       }
     });
     audioStream.pipe(encoder.stdin);
+    queue.currentTrack = track;
     queue.player.play(createAudioResource(encoder.stdout, { inputType: StreamType.OggOpus, metadata: track }));
     queue.starting = false;
     await queue.textChannel?.send(`▶️ Сейчас играет: **${track.title}**${track.author ? ` — ${track.author}` : ''}${track.duration ? ` (${track.duration})` : ''}`);
   } catch (error) {
     console.error(`Не удалось включить «${track.title}»:`, error.message);
     queue.starting = false;
-    queue.tracks.shift();
+      const failedTrack = track;
+      queue.currentTrack = null;
+      if (queue.tracks[0] === failedTrack && failedTrack.alternatives?.length) {
+        const nextTrack = failedTrack.alternatives.shift();
+        nextTrack.alternatives = failedTrack.alternatives;
+        queue.tracks[0] = nextTrack;
+        await queue.textChannel?.send(`Трек недоступен, пробую другой результат: **${nextTrack.title}**`).catch(() => {});
+        await playNext(guildId);
+        return;
+      }
+      queue.tracks.shift();
     await queue.textChannel?.send(`Не получилось включить **${track.title}**. Перехожу дальше.`).catch(() => {});
     await playNext(guildId);
   }
@@ -178,6 +222,7 @@ async function playNext(guildId) {
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Бот запущен: ${readyClient.user.tag}`);
+  console.log(`YouTube cookie: ${process.env.YOUTUBE_COOKIE ? 'задана' : 'не задана'}`);
   // Remove a stale voice state left behind if the previous process was killed abruptly.
   for (const guild of readyClient.guilds.cache.values()) {
     try {
