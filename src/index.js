@@ -36,7 +36,7 @@ function getQueue(guildId) {
   let queue = queues.get(guildId);
   if (!queue) {
     const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
-    queue = { player, connection: null, tracks: [], currentTrack: null, textChannel: null, starting: false, idleTimer: null };
+    queue = { player, connection: null, tracks: [], currentTrack: null, textChannel: null, starting: false, idleTimer: null, retryTimer: null };
     player.on(AudioPlayerStatus.Idle, () => {
       queue.starting = false;
       if (queue.currentTrack && queue.tracks[0] === queue.currentTrack) queue.tracks.shift();
@@ -47,6 +47,7 @@ function getQueue(guildId) {
       console.error('Ошибка воспроизведения:', error.message);
       queue.starting = false;
       const failedTrack = error.resource?.metadata || queue.currentTrack;
+      if (retryPrematureStream(queue, guildId, failedTrack, error)) return;
       queue.currentTrack = null;
       if (/cookie.*(signed out|expired|invalid)|treats the cookie as signed out/i.test(error.message)) {
         queue.tracks.length = 0;
@@ -73,6 +74,24 @@ function getQueue(guildId) {
 function clearIdleTimer(queue) {
   if (queue.idleTimer) clearTimeout(queue.idleTimer);
   queue.idleTimer = null;
+}
+
+function retryPrematureStream(queue, guildId, track, error) {
+  if (!track || !/premature close/i.test(error.message)) return false;
+  if (track._retryScheduled) return true;
+  if (track._prematureCloseRetried) return false;
+  track._prematureCloseRetried = true;
+  track._retryScheduled = true;
+  queue.currentTrack = null;
+  queue.starting = false;
+  queue.retryTimer = setTimeout(() => {
+    queue.retryTimer = null;
+    track._retryScheduled = false;
+    if (queues.get(guildId) === queue && queue.tracks[0] === track) void playNext(guildId);
+  }, 500);
+  queue.retryTimer.unref?.();
+  queue.player.stop(true);
+  return true;
 }
 
 function scheduleIdleDisconnect(guildId, queue) {
@@ -195,7 +214,7 @@ async function resolveTrack(input) {
 
 async function playNext(guildId) {
   const queue = queues.get(guildId);
-  if (!queue || queue.starting) return;
+  if (!queue || queue.starting || queue.retryTimer) return;
   if (!queue.tracks.length) { scheduleIdleDisconnect(guildId, queue); return; }
   clearIdleTimer(queue);
   queue.starting = true;
@@ -207,7 +226,10 @@ async function playNext(guildId) {
     const audioStream = youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
     // The queue may have been stopped while the stream URL was being resolved.
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) { audioStream.destroy(); return; }
-    audioStream.on('error', error => console.error('Ошибка потока YouTube:', error.message));
+    audioStream.on('error', error => {
+      console.error('Ошибка потока YouTube:', error.message);
+      retryPrematureStream(queue, guildId, track, error);
+    });
     queue.currentTrack = track;
     queue.player.play(createAudioResource(audioStream, { inputType: StreamType.WebmOpus, metadata: track }));
     queue.starting = false;
