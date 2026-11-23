@@ -114,14 +114,29 @@ async function getSearchText(url) {
 }
 
 async function resolveTrack(input) {
-  if (isUrl(input) && (play.yt_validate(input) === 'video' || play.yt_validate(input) === 'playlist')) {
+  if (isUrl(input) && ['video', 'playlist'].includes(play.yt_validate(input))) {
+    const { client: youtube } = await getYoutubeClient();
     if (play.yt_validate(input) === 'playlist') {
-      const playlist = await play.playlist_info(input, { incomplete: true });
-      const videos = await playlist.all_videos();
-      return videos.map(video => ({ title: video.title, author: video.channel?.name, url: video.url, duration: video.durationRaw }));
+      const playlist = await youtube.getPlaylist(input, { limit: 100, signal: AbortSignal.timeout(20_000) });
+      return playlist.videos.map(video => ({
+        title: video.title,
+        author: video.author?.name,
+        url: video.url,
+        duration: Number.isFinite(video.lengthSeconds)
+          ? `${Math.floor(video.lengthSeconds / 60)}:${String(video.lengthSeconds % 60).padStart(2, '0')}`
+          : null,
+      }));
     }
-    const info = await play.video_basic_info(input);
-    return [{ title: info.video_details.title, author: info.video_details.channel?.name, url: info.video_details.url, duration: info.video_details.durationRaw }];
+    const info = await youtube.getInfo(input, { signal: AbortSignal.timeout(20_000) });
+    const video = info.videoDetails;
+    return [{
+      title: video.title,
+      author: video.author?.name,
+      url: video.url,
+      duration: Number.isFinite(video.lengthSeconds)
+        ? `${Math.floor(video.lengthSeconds / 60)}:${String(video.lengthSeconds % 60).padStart(2, '0')}`
+        : null,
+    }];
   }
 
   if (isUrl(input) && /soundcloud\.com\//i.test(input)) {
