@@ -120,9 +120,14 @@ async function getSearchText(url) {
 }
 
 async function resolveTrack(input) {
-  if (isUrl(input) && ['video', 'playlist'].includes(play.yt_validate(input))) {
+  const youtubeType = isUrl(input) ? play.yt_validate(input) : false;
+  const youtubeUrl = isUrl(input) ? new URL(input) : null;
+  const isRadioMix = youtubeType === 'playlist'
+    && youtubeUrl?.searchParams.has('v')
+    && /^RD/i.test(youtubeUrl.searchParams.get('list') || '');
+  if (isUrl(input) && (youtubeType === 'video' || youtubeType === 'playlist')) {
     const { client: youtube } = await getYoutubeClient();
-    if (play.yt_validate(input) === 'playlist') {
+    if (youtubeType === 'playlist' && !isRadioMix) {
       const playlist = await youtube.getPlaylist(input, { limit: 100, signal: AbortSignal.timeout(20_000) });
       return playlist.videos.map(video => ({
         title: video.title,
