@@ -18,7 +18,13 @@ let youtubeClientPromise;
 function getYoutubeClient() {
   if (!youtubeClientPromise) {
     youtubeClientPromise = import('@distube/ytdl-core').then(module => ({
-      client: new module.Ytdl({ lang: 'ru', country: 'RU', cookie: process.env.YOUTUBE_COOKIE || undefined }),
+      // These clients do not require the library's BotGuard PO-token minting worker.
+      // Some container hosts cannot run that worker reliably, which breaks audio downloads.
+      client: new module.Ytdl({
+        lang: 'ru',
+        country: 'RU',
+        clients: [module.Client.VisionOS, module.Client.WebEmbedded, module.Client.Tv],
+      }),
       Quality: module.Quality,
       SearchType: module.SearchType,
     }));
@@ -243,7 +249,7 @@ async function playNext(guildId) {
 
 client.once(Events.ClientReady, async readyClient => {
   console.log(`Бот запущен: ${readyClient.user.tag}`);
-  console.log(`YouTube cookie: ${process.env.YOUTUBE_COOKIE ? 'задана' : 'не задана'}`);
+  console.log('YouTube: клиенты без обязательной генерации PO-токена');
   // Remove a stale voice state left behind if the previous process was killed abruptly.
   for (const guild of readyClient.guilds.cache.values()) {
     try {
