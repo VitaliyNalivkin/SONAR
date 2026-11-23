@@ -11,9 +11,11 @@ if (!process.env.DISCORD_TOKEN) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const queues = new Map();
 const IDLE_DISCONNECT_MS = 60_000;
-const YOUTUBE_LOOKUP_TIMEOUT_MS = 8_000;
-const AUDIO_PREFETCH_TIMEOUT_MS = 8_000;
+const YOUTUBE_LOOKUP_TIMEOUT_MS = 5_000;
+const AUDIO_PREFETCH_TIMEOUT_MS = 5_000;
+const TRACK_CACHE_TTL_MS = 300_000;
 let youtubeClientPromise;
+const trackCache = new Map();
 
 function getYoutubeClient() {
   if (!youtubeClientPromise) {
@@ -50,18 +52,18 @@ function getQueue(guildId) {
       const failedTrack = error.resource?.metadata || queue.currentTrack;
       if (retryPrematureStream(queue, guildId, failedTrack, error)) return;
       queue.currentTrack = null;
-      if (/cookie.*(signed out|expired|invalid)|treats the cookie as signed out/i.test(error.message)) {
-        queue.tracks.length = 0;
-        queue.player.stop(true);
-        void queue.textChannel?.send('⏹️ YouTube отклонил cookie: он устарел или аккаунт вышел из него. Обнови `YOUTUBE_COOKIE` на хостинге или удали переменную, затем перезапусти бота.').catch(() => {});
-        return;
-      }
       if (queue.tracks[0] === failedTrack && failedTrack?.alternatives?.length) {
         const nextTrack = failedTrack.alternatives.shift();
         nextTrack.alternatives = failedTrack.alternatives;
         queue.tracks[0] = nextTrack;
-        console.warn(`Видео недоступно, пробую следующий результат: ${nextTrack.title}`);
+        console.warn(`Источник недоступен, пробую следующий результат: ${nextTrack.title} (${nextTrack.source || 'youtube'})`);
         void playNext(guildId);
+        return;
+      }
+      if (/cookie.*(signed out|expired|invalid)|treats the cookie as signed out/i.test(error.message)) {
+        queue.tracks.length = 0;
+        queue.player.stop(true);
+        void queue.textChannel?.send('⏹️ YouTube отклонил cookie: он устарел или аккаунт вышел из него. Обнови `YOUTUBE_COOKIE` на хостинге или удали переменную, затем перезапусти бота.').catch(() => {});
         return;
       }
       queue.tracks.shift();
@@ -127,11 +129,23 @@ async function getSearchText(url) {
         if (title) return title.replace(/&amp;/g, '&').replace(/&#39;|&quot;/g, '');
       }
     }
+    if (/deezer\.com\//i.test(url)) {
+      const track = await play.deezer(url);
+      if (track?.type === 'track' && track.title) return `${track.artist?.name || ''} ${track.title}`.trim();
+    }
   } catch { /* Use the URL as a search query below. */ }
   return url;
 }
 
 async function resolveTrack(input) {
+  const cacheKey = isUrl(input) ? null : input.trim().toLocaleLowerCase('ru-RU');
+  if (cacheKey) {
+    const cached = trackCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return [{ ...cached.track, alternatives: cached.track.alternatives.map(item => ({ ...item })), announced: false }];
+    }
+    if (cached) trackCache.delete(cacheKey);
+  }
   const youtubeType = isUrl(input) ? play.yt_validate(input) : false;
   const youtubeUrl = isUrl(input) ? new URL(input) : null;
   const isRadioMix = youtubeType === 'playlist'
@@ -156,6 +170,7 @@ async function resolveTrack(input) {
       title: video.title,
       author: video.author?.name,
       url: video.url,
+      source: 'youtube',
       info,
       duration: Number.isFinite(video.lengthSeconds)
         ? `${Math.floor(video.lengthSeconds / 60)}:${String(video.lengthSeconds % 60).padStart(2, '0')}`
@@ -165,60 +180,104 @@ async function resolveTrack(input) {
 
   if (isUrl(input) && /soundcloud\.com\//i.test(input)) {
     const info = await play.soundcloud(input);
-    return [{ title: info.name, author: info.user?.name, url: info.url, duration: null }];
+    return [{ title: info.name, author: info.user?.name, url: info.url, source: 'soundcloud', duration: Number.isFinite(info.durationInSec) ? `${Math.floor(info.durationInSec / 60)}:${String(info.durationInSec % 60).padStart(2, '0')}` : null }];
   }
 
-  // Spotify and Yandex links provide track metadata, but not a playable stream.
-  // Resolve their title to a playable YouTube result.
+  // Spotify, Yandex Music and Deezer links provide track metadata, not a full
+  // stream for this bot. Match their title against playable YouTube/SoundCloud results.
   const query = isUrl(input) ? await getSearchText(input) : input;
   const { client: youtube, SearchType } = await getYoutubeClient();
   const options = { limit: 3, signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS), type: SearchType.Video };
-  let results;
-  let searchError;
-  try {
-    results = await youtube.search(query, options);
-  } catch (error) {
-    searchError = error;
-    console.warn('Поиск через ytdl не сработал, пробую резервный поиск:', error.message);
-    try {
-      results = await Promise.race([
-        play.search(query, { limit: 3, source: { youtube: 'video' } }),
-        new Promise((_, reject) => {
-          const timer = setTimeout(() => reject(new Error('Резервный поиск превысил лимит времени')), 5000);
-          timer.unref?.();
-        }),
-      ]);
-    }
-    catch (fallbackError) {
-      console.error('Не удалось выполнить поиск на YouTube:', fallbackError.message);
-      throw new Error(searchError.code === 'HPE_HEADER_OVERFLOW'
-        ? 'YouTube вернул некорректный ответ. Попробуй ещё раз через минуту или вставь прямую ссылку.'
-        : 'Не удалось найти трек. Попробуй другое название или ссылку.');
-    }
-  }
-  const candidates = results.filter(item => item.url && !item.isLive && !item.isUpcoming).slice(0, 3);
-  const video = candidates[0];
-  if (!video) throw new Error('Не удалось найти трек. Попробуй другое название или ссылку.');
-  const toTrack = item => {
+  const startedAt = Date.now();
+  const [youtubeResult, soundCloudResult, deezerResult] = await Promise.allSettled([
+    youtube.search(query, options).then(items => ({ source: 'youtube', items, elapsed: Date.now() - startedAt })),
+    Promise.race([
+      play.search(query, { limit: 3, source: { soundcloud: 'tracks' } }),
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('SoundCloud search timed out')), YOUTUBE_LOOKUP_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]).then(items => ({ source: 'soundcloud', items, elapsed: Date.now() - startedAt })),
+    Promise.race([
+      play.search(query, { limit: 3, source: { deezer: 'track' } }),
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('Deezer search timed out')), YOUTUBE_LOOKUP_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]).then(items => ({ source: 'deezer', items, elapsed: Date.now() - startedAt })),
+  ]);
+  const searchResults = [youtubeResult, soundCloudResult]
+    .filter(result => result.status === 'fulfilled' && result.value.items?.length)
+    .map(result => result.value)
+    .sort((a, b) => a.elapsed - b.elapsed);
+  const toYoutubeTrack = item => {
     const seconds = Number.isFinite(item.lengthSeconds) ? item.lengthSeconds : item.durationInSec;
     return {
       title: item.title,
       author: item.author?.name || item.channel?.name || item.channel?.title,
       url: item.url,
+      source: 'youtube',
       duration: Number.isFinite(seconds) ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : item.durationRaw || null,
     };
   };
-  const track = toTrack(video);
-  // Resolve media formats before acknowledging the queue entry so playback does not
-  // perform this separate YouTube lookup after the user sees "Сейчас играет".
-  track.info = await youtube.getInfo(track.url, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
-  const details = track.info.videoDetails;
-  track.title = details.title || track.title;
-  track.author = details.author?.name || track.author;
-  if (Number.isFinite(details.lengthSeconds)) {
-    track.duration = `${Math.floor(details.lengthSeconds / 60)}:${String(details.lengthSeconds % 60).padStart(2, '0')}`;
+  const toSoundCloudTrack = item => ({
+    title: item.name || item.title,
+    author: item.user?.name || item.publisher?.artist || item.author?.name,
+    url: item.permalink || item.url,
+    source: 'soundcloud',
+    duration: Number.isFinite(item.durationInSec) ? `${Math.floor(item.durationInSec / 60)}:${String(item.durationInSec % 60).padStart(2, '0')}` : null,
+  });
+  const candidates = searchResults.flatMap(result => result.source === 'youtube'
+    ? result.items.filter(item => item.url && !item.isLive && !item.isUpcoming).slice(0, 3).map(toYoutubeTrack)
+    : result.items.filter(item => item.permalink || item.url).slice(0, 3).map(toSoundCloudTrack));
+  if (!candidates.length) throw new Error('Не удалось найти трек в YouTube или SoundCloud. Попробуй другое название или ссылку.');
+  const deezerItems = deezerResult.status === 'fulfilled' ? deezerResult.value.items : [];
+  const referenceTrack = deezerItems[0];
+  if (referenceTrack) {
+    const words = `${referenceTrack.artist?.name || ''} ${referenceTrack.title || ''}`
+      .toLocaleLowerCase('ru-RU').split(/[^\p{L}\p{N}]+/u).filter(word => word.length > 1);
+    const score = candidate => {
+      const text = `${candidate.title || ''} ${candidate.author || ''}`.toLocaleLowerCase('ru-RU');
+      return words.length ? words.filter(word => text.includes(word)).length / words.length : 0;
+    };
+    candidates.sort((a, b) => score(b) - score(a));
   }
-  track.alternatives = candidates.slice(1).map(toTrack);
+  let track;
+  let infoError;
+  while (candidates.length) {
+    const candidate = candidates.shift();
+    if (candidate.source === 'youtube') {
+      try {
+        const info = await youtube.getInfo(candidate.url, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
+        candidate.info = info;
+        candidate.title = info.videoDetails.title || candidate.title;
+        candidate.author = info.videoDetails.author?.name || candidate.author;
+        if (Number.isFinite(info.videoDetails.lengthSeconds)) {
+          candidate.duration = `${Math.floor(info.videoDetails.lengthSeconds / 60)}:${String(info.videoDetails.lengthSeconds % 60).padStart(2, '0')}`;
+        }
+        track = candidate;
+        break;
+      } catch (error) {
+        infoError = error;
+        console.warn('YouTube result unavailable, trying another source:', error.message);
+      }
+    } else {
+      track = candidate;
+      break;
+    }
+  }
+  if (!track) {
+    if (infoError?.code === 'HPE_HEADER_OVERFLOW') throw new Error('YouTube вернул некорректный ответ. Попробуй ещё раз или вставь прямую ссылку.');
+    throw new Error('Не удалось открыть найденные треки. Попробуй другое название или ссылку.');
+  }
+  track.alternatives = candidates;
+  if (cacheKey) {
+    trackCache.set(cacheKey, {
+      track: { ...track, alternatives: track.alternatives.map(item => ({ ...item })), preparedStream: null, announced: false },
+      expiresAt: Date.now() + TRACK_CACHE_TTL_MS,
+    });
+    if (trackCache.size > 100) trackCache.delete(trackCache.keys().next().value);
+  }
   return [track];
 }
 
@@ -234,9 +293,9 @@ function waitForReadableData(stream, timeoutMs) {
     const onReadable = () => {
       if (stream.readableLength > 0) { cleanup(); resolve(); }
     };
-    const onEnd = () => { cleanup(); reject(new Error('YouTube завершил поток до получения аудио')); };
+    const onEnd = () => { cleanup(); reject(new Error('Источник завершил поток до получения аудио')); };
     const onError = error => { cleanup(); reject(error); };
-    const timer = setTimeout(() => { cleanup(); reject(new Error('YouTube долго готовил аудиопоток. Попробуй ещё раз.')); }, timeoutMs);
+    const timer = setTimeout(() => { cleanup(); reject(new Error('Источник долго готовил аудиопоток. Попробуй ещё раз.')); }, timeoutMs);
     timer.unref?.();
     stream.on('readable', onReadable);
     stream.once('end', onEnd);
@@ -245,16 +304,30 @@ function waitForReadableData(stream, timeoutMs) {
 }
 
 async function prepareTrackStream(track) {
-  const { client: youtube, Quality } = await getYoutubeClient();
-  if (!track.info) track.info = await youtube.getInfo(track.url, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
+  let youtube;
+  let Quality;
+  if (track.source !== 'soundcloud') {
+    ({ client: youtube, Quality } = await getYoutubeClient());
+    if (!track.info) track.info = await youtube.getInfo(track.url, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
-    const stream = youtube.download(track.info, {
-      quality: Quality.HighestAudio,
-      filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' },
-    });
+    let stream;
+    let inputType;
+    if (track.source === 'soundcloud') {
+      const result = await play.stream(track.url, { discordPlayerCompatibility: true });
+      stream = result.stream;
+      inputType = Object.values(StreamType).includes(result.type) ? result.type : StreamType.Arbitrary;
+    } else {
+      stream = youtube.download(track.info, {
+        quality: Quality.HighestAudio,
+        filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' },
+      });
+      inputType = StreamType.WebmOpus;
+    }
     try {
       await waitForReadableData(stream, AUDIO_PREFETCH_TIMEOUT_MS);
       track.preparedStream = stream;
+      track.preparedInputType = inputType;
       return;
     } catch (error) {
       stream.destroy();
@@ -272,15 +345,24 @@ async function playNext(guildId) {
   queue.starting = true;
   const track = queue.tracks[0];
   try {
-    const { client: youtube, Quality } = await getYoutubeClient();
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) return;
-    // Pass YouTube's Opus stream straight to Discord to avoid FFmpeg startup and transcoding delay.
-    const audioStream = track.preparedStream || youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
+    let audioStream = track.preparedStream;
+    let inputType = track.preparedInputType;
+    if (!audioStream && track.source === 'soundcloud') {
+      const result = await play.stream(track.url, { discordPlayerCompatibility: true });
+      audioStream = result.stream;
+      inputType = Object.values(StreamType).includes(result.type) ? result.type : StreamType.Arbitrary;
+    } else if (!audioStream) {
+      const { client: youtube, Quality } = await getYoutubeClient();
+      audioStream = youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
+      inputType = StreamType.WebmOpus;
+    }
     track.preparedStream = null;
+    track.preparedInputType = null;
     // The queue may have been stopped while the stream URL was being resolved.
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) { audioStream.destroy(); return; }
     audioStream.on('error', error => {
-      console.error('Ошибка потока YouTube:', error.message);
+      console.error(`Ошибка аудиопотока (${track.source || 'youtube'}):`, error.message);
       retryPrematureStream(queue, guildId, track, error);
     });
     queue.currentTrack = track;
@@ -293,7 +375,7 @@ async function playNext(guildId) {
       if (queue.currentTrack === track) queue.currentTrack = null;
       return;
     }
-    queue.player.play(createAudioResource(audioStream, { inputType: StreamType.WebmOpus, metadata: track }));
+    queue.player.play(createAudioResource(audioStream, { inputType, metadata: track }));
     queue.starting = false;
   } catch (error) {
     console.error(`Не удалось включить «${track.title}»:`, error.message);
@@ -368,7 +450,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!voiceChannel) return interaction.reply({ content: 'Сначала зайди в голосовой канал.', flags: MessageFlags.Ephemeral });
     const input = interaction.options.getString('запрос', true).trim();
     await interaction.deferReply();
-    await interaction.editReply('🔎 Ищу трек и подготавливаю аудио…');
+    await interaction.editReply('🔎 Ищу трек в YouTube, SoundCloud и Deezer…');
     const queue = getQueue(interaction.guildId);
     try {
       if (!queue.connection || queue.connection.state.status === 'destroyed') {
