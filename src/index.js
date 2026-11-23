@@ -13,6 +13,7 @@ if (!process.env.DISCORD_TOKEN) {
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const queues = new Map();
 const IDLE_DISCONNECT_MS = 60_000;
+const YOUTUBE_LOOKUP_TIMEOUT_MS = 8_000;
 let youtubeClientPromise;
 
 function getYoutubeClient() {
@@ -101,7 +102,7 @@ function isUrl(value) {
 async function getSearchText(url) {
   try {
     if (/open\.spotify\.com\/track\//i.test(url)) {
-      const response = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`);
+      const response = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(6000) });
       if (response.ok) {
         const data = await response.json();
         if (data.title) return data.title;
@@ -139,12 +140,13 @@ async function resolveTrack(input) {
           : null,
       }));
     }
-    const info = await youtube.getInfo(input, { signal: AbortSignal.timeout(20_000) });
+    const info = await youtube.getInfo(input, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
     const video = info.videoDetails;
     return [{
       title: video.title,
       author: video.author?.name,
       url: video.url,
+      info,
       duration: Number.isFinite(video.lengthSeconds)
         ? `${Math.floor(video.lengthSeconds / 60)}:${String(video.lengthSeconds % 60).padStart(2, '0')}`
         : null,
@@ -160,16 +162,23 @@ async function resolveTrack(input) {
   // Resolve their title to a playable YouTube result.
   const query = isUrl(input) ? await getSearchText(input) : input;
   const { client: youtube, SearchType } = await getYoutubeClient();
-  const options = { limit: 5, signal: AbortSignal.timeout(15_000) };
+  const options = { limit: 3, signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS), type: SearchType.Video };
   let results;
   let searchError;
   try {
-    results = await youtube.search(query, { ...options, type: SearchType.Song });
-    if (!results.length) results = await youtube.search(query, { ...options, type: SearchType.Video });
+    results = await youtube.search(query, options);
   } catch (error) {
     searchError = error;
     console.warn('Поиск через ytdl не сработал, пробую резервный поиск:', error.message);
-    try { results = await play.search(query, { limit: 5, source: { youtube: 'video' } }); }
+    try {
+      results = await Promise.race([
+        play.search(query, { limit: 3, source: { youtube: 'video' } }),
+        new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error('Резервный поиск превысил лимит времени')), 5000);
+          timer.unref?.();
+        }),
+      ]);
+    }
     catch (fallbackError) {
       console.error('Не удалось выполнить поиск на YouTube:', fallbackError.message);
       throw new Error(searchError.code === 'HPE_HEADER_OVERFLOW'
@@ -177,7 +186,7 @@ async function resolveTrack(input) {
         : 'Не удалось найти трек. Попробуй другое название или ссылку.');
     }
   }
-  const candidates = results.filter(item => item.url && !item.isLive && !item.isUpcoming).slice(0, 5);
+  const candidates = results.filter(item => item.url && !item.isLive && !item.isUpcoming).slice(0, 3);
   const video = candidates[0];
   if (!video) throw new Error('Не удалось найти трек. Попробуй другое название или ссылку.');
   const toTrack = item => {
@@ -207,7 +216,7 @@ async function playNext(guildId) {
     // Discord can forward Opus packets directly; selecting WebM/Opus avoids
     // probing/transcoding the stream and does not require an FFmpeg install.
     if (!ffmpegPath) throw new Error('Не найден FFmpeg. Повтори установку зависимостей через start.bat.');
-    const audioStream = youtube.download(track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
+    const audioStream = youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
     // The queue may have been stopped while the stream URL was being resolved.
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) { audioStream.destroy(); return; }
     const encoder = spawn(ffmpegPath, [
@@ -308,6 +317,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!voiceChannel) return interaction.reply({ content: 'Сначала зайди в голосовой канал.', flags: MessageFlags.Ephemeral });
     const input = interaction.options.getString('запрос', true).trim();
     await interaction.deferReply();
+    await interaction.editReply('🔎 Ищу трек…');
     try {
       const tracks = await resolveTrack(input);
       const queue = getQueue(interaction.guildId);
