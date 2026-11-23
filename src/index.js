@@ -12,6 +12,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const queues = new Map();
 const IDLE_DISCONNECT_MS = 60_000;
 const YOUTUBE_LOOKUP_TIMEOUT_MS = 8_000;
+const AUDIO_PREFETCH_TIMEOUT_MS = 8_000;
 let youtubeClientPromise;
 
 function getYoutubeClient() {
@@ -208,8 +209,59 @@ async function resolveTrack(input) {
     };
   };
   const track = toTrack(video);
+  // Resolve media formats before acknowledging the queue entry so playback does not
+  // perform this separate YouTube lookup after the user sees "Сейчас играет".
+  track.info = await youtube.getInfo(track.url, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
+  const details = track.info.videoDetails;
+  track.title = details.title || track.title;
+  track.author = details.author?.name || track.author;
+  if (Number.isFinite(details.lengthSeconds)) {
+    track.duration = `${Math.floor(details.lengthSeconds / 60)}:${String(details.lengthSeconds % 60).padStart(2, '0')}`;
+  }
   track.alternatives = candidates.slice(1).map(toTrack);
   return [track];
+}
+
+function waitForReadableData(stream, timeoutMs) {
+  if (stream.readableLength > 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.removeListener('readable', onReadable);
+      stream.removeListener('end', onEnd);
+      stream.removeListener('error', onError);
+    };
+    const onReadable = () => {
+      if (stream.readableLength > 0) { cleanup(); resolve(); }
+    };
+    const onEnd = () => { cleanup(); reject(new Error('YouTube завершил поток до получения аудио')); };
+    const onError = error => { cleanup(); reject(error); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('YouTube долго готовил аудиопоток. Попробуй ещё раз.')); }, timeoutMs);
+    timer.unref?.();
+    stream.on('readable', onReadable);
+    stream.once('end', onEnd);
+    stream.once('error', onError);
+  });
+}
+
+async function prepareTrackStream(track) {
+  const { client: youtube, Quality } = await getYoutubeClient();
+  if (!track.info) track.info = await youtube.getInfo(track.url, { signal: AbortSignal.timeout(YOUTUBE_LOOKUP_TIMEOUT_MS) });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const stream = youtube.download(track.info, {
+      quality: Quality.HighestAudio,
+      filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' },
+    });
+    try {
+      await waitForReadableData(stream, AUDIO_PREFETCH_TIMEOUT_MS);
+      track.preparedStream = stream;
+      return;
+    } catch (error) {
+      stream.destroy();
+      if (attempt === 0 && /premature close/i.test(error.message)) continue;
+      throw error;
+    }
+  }
 }
 
 async function playNext(guildId) {
@@ -223,7 +275,8 @@ async function playNext(guildId) {
     const { client: youtube, Quality } = await getYoutubeClient();
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) return;
     // Pass YouTube's Opus stream straight to Discord to avoid FFmpeg startup and transcoding delay.
-    const audioStream = youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
+    const audioStream = track.preparedStream || youtube.download(track.info || track.url, { quality: Quality.HighestAudio, filter: { hasAudio: true, hasVideo: false, audioCodec: 'opus' } });
+    track.preparedStream = null;
     // The queue may have been stopped while the stream URL was being resolved.
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) { audioStream.destroy(); return; }
     audioStream.on('error', error => {
@@ -231,9 +284,17 @@ async function playNext(guildId) {
       retryPrematureStream(queue, guildId, track, error);
     });
     queue.currentTrack = track;
+    if (!track.announced) {
+      await queue.textChannel?.send(`▶️ Сейчас играет: **${track.title}**${track.author ? ` — ${track.author}` : ''}${track.duration ? ` (${track.duration})` : ''}`).catch(() => {});
+    }
+    track.announced = false;
+    if (queues.get(guildId) !== queue || queue.tracks[0] !== track) {
+      audioStream.destroy();
+      if (queue.currentTrack === track) queue.currentTrack = null;
+      return;
+    }
     queue.player.play(createAudioResource(audioStream, { inputType: StreamType.WebmOpus, metadata: track }));
     queue.starting = false;
-    await queue.textChannel?.send(`▶️ Сейчас играет: **${track.title}**${track.author ? ` — ${track.author}` : ''}${track.duration ? ` (${track.duration})` : ''}`);
   } catch (error) {
     console.error(`Не удалось включить «${track.title}»:`, error.message);
     queue.starting = false;
@@ -307,7 +368,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!voiceChannel) return interaction.reply({ content: 'Сначала зайди в голосовой канал.', flags: MessageFlags.Ephemeral });
     const input = interaction.options.getString('запрос', true).trim();
     await interaction.deferReply();
-    await interaction.editReply('🔎 Ищу трек…');
+    await interaction.editReply('🔎 Ищу трек и подготавливаю аудио…');
     const queue = getQueue(interaction.guildId);
     try {
       if (!queue.connection || queue.connection.state.status === 'destroyed') {
@@ -319,12 +380,21 @@ client.on(Events.InteractionCreate, async interaction => {
       queue.textChannel = interaction.channel;
       clearIdleTimer(queue);
       const tracks = await resolveTrack(input);
+      if (tracks[0]) await prepareTrackStream(tracks[0]);
+      const startsImmediately = queue.tracks.length === 0
+        && !queue.starting
+        && queue.player.state.status !== AudioPlayerStatus.Playing;
       queue.tracks.push(...tracks);
       const first = tracks[0];
       const firstLabel = `**${first.title}**${first.author ? ` — ${first.author}` : ''}`;
-      await interaction.editReply(tracks.length > 1
-        ? `Добавлен плейлист: **${tracks.length} треков** (первый — ${firstLabel}).`
-        : `Добавлено в очередь: ${firstLabel}`);
+      if (startsImmediately) {
+        first.announced = true;
+        await interaction.editReply(`▶️ Сейчас играет: ${firstLabel}${first.duration ? ` (${first.duration})` : ''}`);
+      } else {
+        await interaction.editReply(tracks.length > 1
+          ? `Добавлен плейлист: **${tracks.length} треков** (первый — ${firstLabel}).`
+          : `Добавлено в очередь: ${firstLabel}`);
+      }
       if (queue.player.state.status !== AudioPlayerStatus.Playing && !queue.starting) void playNext(interaction.guildId);
     } catch (error) {
       console.error('Ошибка поиска:', error.message);
@@ -345,6 +415,14 @@ client.on(Events.InteractionCreate, async interaction => {
   }
   if (interaction.commandName === 'skip') {
     if (!queue.tracks.length) return interaction.reply({ content: 'Очередь уже пуста.', flags: MessageFlags.Ephemeral });
+    if (queue.starting && queue.player.state.status === AudioPlayerStatus.Idle) {
+      const pendingTrack = queue.tracks.shift();
+      queue.currentTrack = null;
+      queue.starting = false;
+      if (pendingTrack?.preparedStream) pendingTrack.preparedStream.destroy();
+      void playNext(interaction.guildId);
+      return interaction.reply('⏭️ Переключаю трек.');
+    }
     queue.player.stop(true);
     return interaction.reply('⏭️ Переключаю трек.');
   }
