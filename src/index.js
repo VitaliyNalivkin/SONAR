@@ -221,10 +221,11 @@ async function playNext(guildId) {
     if (queues.get(guildId) !== queue || queue.tracks[0] !== track) { audioStream.destroy(); return; }
     const encoder = spawn(ffmpegPath, [
       '-hide_banner', '-loglevel', 'error',
+      '-fflags', 'nobuffer', '-probesize', '32', '-analyzeduration', '0',
       '-i', 'pipe:0', '-vn',
-      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+      '-af', 'dynaudnorm=f=100:g=5:p=0.95:m=10',
       '-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '2', '-application', 'audio',
-      '-f', 'ogg', 'pipe:1',
+      '-flush_packets', '1', '-page_duration', '20000', '-f', 'ogg', 'pipe:1',
     ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     queue.ffmpegProcess = encoder;
     let encoderError = '';
@@ -331,9 +332,10 @@ client.on(Events.InteractionCreate, async interaction => {
       clearIdleTimer(queue);
       queue.tracks.push(...tracks);
       const first = tracks[0];
+      const firstLabel = `**${first.title}**${first.author ? ` — ${first.author}` : ''}`;
       await interaction.editReply(tracks.length > 1
-        ? `Добавлен плейлист: **${tracks.length} треков** (первый — **${first.title}**).`
-        : `Добавлено в очередь: **${first.title}**`);
+        ? `Добавлен плейлист: **${tracks.length} треков** (первый — ${firstLabel}).`
+        : `Добавлено в очередь: ${firstLabel}`);
       if (queue.player.state.status !== AudioPlayerStatus.Playing && !queue.starting) void playNext(interaction.guildId);
     } catch (error) {
       console.error('Ошибка поиска:', error.message);
