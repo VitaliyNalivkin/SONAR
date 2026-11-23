@@ -44,6 +44,12 @@ function getQueue(guildId) {
       stopEncoder(queue);
       const failedTrack = error.resource?.metadata || queue.currentTrack;
       queue.currentTrack = null;
+      if (/cookie.*(signed out|expired|invalid)|treats the cookie as signed out/i.test(error.message)) {
+        queue.tracks.length = 0;
+        queue.player.stop(true);
+        void queue.textChannel?.send('⏹️ YouTube отклонил cookie: он устарел или аккаунт вышел из него. Обнови `YOUTUBE_COOKIE` на хостинге или удали переменную, затем перезапусти бота.').catch(() => {});
+        return;
+      }
       if (queue.tracks[0] === failedTrack && failedTrack?.alternatives?.length) {
         const nextTrack = failedTrack.alternatives.shift();
         nextTrack.alternatives = failedTrack.alternatives;
@@ -293,8 +299,11 @@ client.on(Events.InteractionCreate, async interaction => {
         : `Добавлено в очередь: **${first.title}**`);
       if (queue.player.state.status !== AudioPlayerStatus.Playing && !queue.starting) void playNext(interaction.guildId);
     } catch (error) {
-      console.error('Ошибка поиска:', error);
-      await interaction.editReply(error.message || 'Не удалось найти или открыть этот трек.');
+      console.error('Ошибка поиска:', error.message);
+      const message = error.code === 'HPE_HEADER_OVERFLOW'
+        ? 'YouTube вернул некорректный ответ. Попробуй ещё раз позже или вставь прямую ссылку на видео.'
+        : (error.message || 'Не удалось найти или открыть этот трек.');
+      await interaction.editReply(message);
     }
     return;
   }
